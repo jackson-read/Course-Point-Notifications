@@ -52,7 +52,6 @@ function parseDueDate(dateStr, timeStr) {
   const cleanTime = timeStr.replace(/\s+/g, ' ').trim();
   let parsed = new Date(`${cleanDate}, ${year} ${cleanTime}`);
 
-  // Handle New Year rollover (e.g. checking in Dec for a Jan assignment)
   if (parsed - now < -1000 * 60 * 60 * 24 * 60) {
     parsed = new Date(`${cleanDate}, ${year + 1} ${cleanTime}`);
   }
@@ -65,12 +64,16 @@ async function runCheck() {
 
   const browser = await puppeteer.launch({
     executablePath: process.env.CHROMIUM_PATH || '/data/data/com.termux/files/usr/bin/chromium-browser',
-    headless: 'new',
+    headless: true,
+    ignoreHTTPSErrors: true,
     args: [
       '--no-sandbox',
       '--disable-setuid-sandbox',
       '--disable-dev-shm-usage',
-      '--disable-gpu'
+      '--disable-gpu',
+      '--no-zygote',
+      '--single-process',
+      '--ignore-certificate-errors'
     ]
   });
 
@@ -78,20 +81,37 @@ async function runCheck() {
     const page = await browser.newPage();
     await page.setViewport({ width: 1280, height: 800 });
 
-    // 1. Disguise Headless Chromium so CoursePoint/SSO doesn't abort the connection
     await page.setUserAgent(
       'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/129.0.0.0 Safari/537.36'
     );
 
+    // Log exact network error if a main frame navigation fails
+    page.on('requestfailed', req => {
+      if (req.isNavigationRequest()) {
+        console.log(`Navigation Failed [${req.url()}]: ${req.failure()?.errorText}`);
+      }
+    });
+
     const courseUrls = process.env.COURSE_URLS.split(',').map(u => u.trim());
     const firstCourseUrl = courseUrls[0];
 
-    // 2. Trigger fresh SSO redirect & Log In
     console.log('Navigating to login portal...');
     await page.goto('https://medicine.lww.com/MyContent', {
       waitUntil: 'domcontentloaded',
       timeout: 60000
-    }).catch(e => console.log('Redirecting to SSO...', e.message));
+    }).catch(e => console.log('Redirect note:', e.message));
+
+    console.log('Current page URL:', page.url());
+
+    // If medicine.lww.com has a "Return User / Log In" link before the SSO page, click it
+    if (!page.url().includes('sso.wkhpe.com')) {
+      const loginLink = await page.$('a[href*="Login"], a[href*="sso"], button[id*="login"], .login-btn');
+      if (loginLink) {
+        console.log('Clicking portal login button...');
+        await loginLink.click();
+        await page.waitForNavigation({ waitUntil: 'domcontentloaded', timeout: 30000 }).catch(() => {});
+      }
+    }
 
     try {
       await page.waitForSelector('#Email', { timeout: 15000 });
@@ -100,7 +120,8 @@ async function runCheck() {
       await page.goto(firstCourseUrl, {
         waitUntil: 'domcontentloaded',
         timeout: 60000
-      }).catch(e => console.log('Handling SSO redirect...', e.message));
+      }).catch(e => console.log('Course redirect note:', e.message));
+      console.log('Current page URL after course redirect:', page.url());
       await page.waitForSelector('#Email', { timeout: 30000 });
     }
 
@@ -114,10 +135,10 @@ async function runCheck() {
       page.click('#primaryLoginButton')
     ]);
 
-    // Give the post-login SSO redirect a few seconds to settle
     await new Promise(r => setTimeout(r, 6000));
+    console.log('Post-login URL:', page.url());
 
-    // Optional: Click "Launch to courses" if needed to establish session cookies for phoenix-ccm
+    // Optional: Click "Launch to courses" if present
     try {
       const launchBtn = await page.waitForSelector('::-p-text(Launch to courses)', { timeout: 8000 });
       if (launchBtn) {
@@ -132,7 +153,7 @@ async function runCheck() {
       console.log('Skipping Launch button or already authenticated.');
     }
 
-    // 3. Loop through each Course Assignment URL
+    // Loop through each Course Assignment URL
     const state = loadState();
     const now = new Date();
 
@@ -140,15 +161,13 @@ async function runCheck() {
       console.log(`Checking course URL: ${url}`);
       await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 60000 }).catch(() => {});
 
-      // Wait for Angular to render the assignment cards
       try {
         await page.waitForSelector('section.list-item', { timeout: 25000 });
       } catch {
-        console.log('No assignments currently listed on this page (or still loading).');
+        console.log(`No assignments found at ${page.url()}`);
         continue;
       }
 
-      // Extract details directly from the Angular DOM
       const assignments = await page.evaluate(() => {
         const items = document.querySelectorAll('section.list-item');
         return Array.from(items).map(section => {
@@ -170,17 +189,14 @@ async function runCheck() {
 
       console.log(`Found ${assignments.length} assignments. Checking notification rules...`);
 
-      // 4. Evaluate Notification Rules (New, 7-Day, 1-Day)
       for (const item of assignments) {
         if (!item.title || !item.dateText) continue;
 
         const dueDate = parseDueDate(item.dateText, item.timeText);
         const hoursUntilDue = (dueDate - now) / (1000 * 60 * 60);
 
-        // Skip past-due assignments
         if (hoursUntilDue < 0) continue;
 
-        // Initialize tracking record if brand new
         if (!state[item.id]) {
           state[item.id] = {
             title: item.title,
@@ -193,7 +209,6 @@ async function runCheck() {
 
         const record = state[item.id];
 
-        // Rule A: Brand New Assignment Posted
         if (!record.notifiedNew) {
           await sendPushover(
             'New CoursePoint Assignment',
@@ -210,7 +225,6 @@ async function runCheck() {
           continue;
         }
 
-        // Rule B: 1 Week (7 Days / <= 168 hours) Warning
         if (!record.notified7Days && hoursUntilDue <= 168 && hoursUntilDue > 24) {
           const daysLeft = Math.ceil(hoursUntilDue / 24);
           await sendPushover(
@@ -222,7 +236,6 @@ async function runCheck() {
           record.notified7Days = true;
         }
 
-        // Rule C: 1 Day (<= 24 hours) Urgent Warning
         if (!record.notified1Day && hoursUntilDue <= 24 && hoursUntilDue > 0) {
           const hrsLeft = Math.round(hoursUntilDue);
           await sendPushover(
@@ -246,7 +259,6 @@ async function runCheck() {
   }
 }
 
-// Run immediately on boot, then every 2 hours on the hour
 runCheck();
 cron.schedule('0 */2 * * *', () => {
   runCheck();
