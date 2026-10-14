@@ -19,11 +19,11 @@ function saveState(state) {
   fs.writeFileSync(CACHE_FILE, JSON.stringify(state, null, 2));
 }
 
-// --- PUSHOVER NOTIFICATION ---
+// --- PUSHOVER NOTIFICATION (Returns true if delivered, false if failed) ---
 async function sendPushover(title, message, url, priority = '0') {
   const payload = new URLSearchParams({
-    token: process.env.PUSHOVER_TOKEN,
-    user: process.env.PUSHOVER_USER,
+    token: process.env.PUSHOVER_TOKEN?.trim(),
+    user: process.env.PUSHOVER_USER?.trim(),
     title,
     message,
     url,
@@ -37,9 +37,14 @@ async function sendPushover(title, message, url, priority = '0') {
       method: 'POST',
       body: payload
     });
-    if (!res.ok) console.error('Pushover API Error:', await res.text());
+    if (!res.ok) {
+      console.error('Pushover API Error:', await res.text());
+      return false;
+    }
+    return true;
   } catch (err) {
     console.error('Failed to reach Pushover:', err);
+    return false;
   }
 }
 
@@ -85,13 +90,6 @@ async function runCheck() {
       'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/129.0.0.0 Safari/537.36'
     );
 
-    // Log exact network error if a main frame navigation fails
-    page.on('requestfailed', req => {
-      if (req.isNavigationRequest()) {
-        console.log(`Navigation Failed [${req.url()}]: ${req.failure()?.errorText}`);
-      }
-    });
-
     const courseUrls = process.env.COURSE_URLS.split(',').map(u => u.trim());
     const firstCourseUrl = courseUrls[0];
 
@@ -101,13 +99,9 @@ async function runCheck() {
       timeout: 60000
     }).catch(e => console.log('Redirect note:', e.message));
 
-    console.log('Current page URL:', page.url());
-
-    // If medicine.lww.com has a "Return User / Log In" link before the SSO page, click it
     if (!page.url().includes('sso.wkhpe.com')) {
       const loginLink = await page.$('a[href*="Login"], a[href*="sso"], button[id*="login"], .login-btn');
       if (loginLink) {
-        console.log('Clicking portal login button...');
         await loginLink.click();
         await page.waitForNavigation({ waitUntil: 'domcontentloaded', timeout: 30000 }).catch(() => {});
       }
@@ -121,7 +115,6 @@ async function runCheck() {
         waitUntil: 'domcontentloaded',
         timeout: 60000
       }).catch(e => console.log('Course redirect note:', e.message));
-      console.log('Current page URL after course redirect:', page.url());
       await page.waitForSelector('#Email', { timeout: 30000 });
     }
 
@@ -136,13 +129,11 @@ async function runCheck() {
     ]);
 
     await new Promise(r => setTimeout(r, 6000));
-    console.log('Post-login URL:', page.url());
 
     // Optional: Click "Launch to courses" if present
     try {
       const launchBtn = await page.waitForSelector('::-p-text(Launch to courses)', { timeout: 8000 });
       if (launchBtn) {
-        console.log('Clicking Launch to courses...');
         await Promise.all([
           page.waitForNavigation({ waitUntil: 'domcontentloaded', timeout: 45000 }).catch(() => {}),
           launchBtn.click()
@@ -156,6 +147,7 @@ async function runCheck() {
     // Loop through each Course Assignment URL
     const state = loadState();
     const now = new Date();
+    let sentCount = 0;
 
     for (const url of courseUrls) {
       console.log(`Checking course URL: ${url}`);
@@ -209,48 +201,60 @@ async function runCheck() {
 
         const record = state[item.id];
 
+        // Rule A: Brand New Assignment Posted
         if (!record.notifiedNew) {
-          await sendPushover(
+          const ok = await sendPushover(
             'New CoursePoint Assignment',
             `${item.title}\nDue: ${item.dateText} at ${item.timeText}`,
             url,
             '0'
           );
-          record.notifiedNew = true;
-          if (hoursUntilDue <= 168 && hoursUntilDue > 24) record.notified7Days = true;
-          if (hoursUntilDue <= 24) {
-            record.notified7Days = true;
-            record.notified1Day = true;
+          if (ok) {
+            record.notifiedNew = true;
+            sentCount++;
+            if (hoursUntilDue <= 168 && hoursUntilDue > 24) record.notified7Days = true;
+            if (hoursUntilDue <= 24) {
+              record.notified7Days = true;
+              record.notified1Day = true;
+            }
           }
           continue;
         }
 
+        // Rule B: 1 Week (7 Days / <= 168 hours) Warning
         if (!record.notified7Days && hoursUntilDue <= 168 && hoursUntilDue > 24) {
           const daysLeft = Math.ceil(hoursUntilDue / 24);
-          await sendPushover(
+          const ok = await sendPushover(
             'Upcoming Due Date (1 Week)',
             `${item.title}\nDue in ~${daysLeft} days (${item.dateText} at ${item.timeText})`,
             url,
             '0'
           );
-          record.notified7Days = true;
+          if (ok) {
+            record.notified7Days = true;
+            sentCount++;
+          }
         }
 
+        // Rule C: 1 Day (<= 24 hours) Urgent Warning
         if (!record.notified1Day && hoursUntilDue <= 24 && hoursUntilDue > 0) {
           const hrsLeft = Math.round(hoursUntilDue);
-          await sendPushover(
+          const ok = await sendPushover(
             'Due Tomorrow: CoursePoint',
             `${item.title}\nDue in ${hrsLeft} hours (${item.dateText} at ${item.timeText})`,
             url,
             '1'
           );
-          record.notified1Day = true;
+          if (ok) {
+            record.notified1Day = true;
+            sentCount++;
+          }
         }
       }
     }
 
     saveState(state);
-    console.log('Check finished successfully.');
+    console.log(`Check finished successfully. Sent ${sentCount} notifications.`);
 
   } catch (error) {
     console.error('Scraper encountered an error:', error);
