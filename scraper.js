@@ -48,7 +48,6 @@ function parseDueDate(dateStr, timeStr) {
   const now = new Date();
   let year = now.getFullYear();
 
-  // Combine into standard parseable string: "Oct 18, 2026 11:59 PM"
   const cleanDate = dateStr.replace(/\s+/g, ' ').trim();
   const cleanTime = timeStr.replace(/\s+/g, ' ').trim();
   let parsed = new Date(`${cleanDate}, ${year} ${cleanTime}`);
@@ -79,48 +78,73 @@ async function runCheck() {
     const page = await browser.newPage();
     await page.setViewport({ width: 1280, height: 800 });
 
-    // 1. Trigger fresh SSO redirect & Log In
-    console.log('Navigating to login portal...');
-    await page.goto('https://medicine.lww.com/MyContent', { waitUntil: 'networkidle2', timeout: 60000 });
+    // 1. Disguise Headless Chromium so CoursePoint/SSO doesn't abort the connection
+    await page.setUserAgent(
+      'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/129.0.0.0 Safari/537.36'
+    );
 
-    // Wait for the SSO Email input
-    await page.waitForSelector('#Email', { timeout: 30000 });
+    const courseUrls = process.env.COURSE_URLS.split(',').map(u => u.trim());
+    const firstCourseUrl = courseUrls[0];
+
+    // 2. Trigger fresh SSO redirect & Log In
+    console.log('Navigating to login portal...');
+    await page.goto('https://medicine.lww.com/MyContent', {
+      waitUntil: 'domcontentloaded',
+      timeout: 60000
+    }).catch(e => console.log('Redirecting to SSO...', e.message));
+
+    try {
+      await page.waitForSelector('#Email', { timeout: 15000 });
+    } catch {
+      console.log('Trying direct course URL to force SSO...');
+      await page.goto(firstCourseUrl, {
+        waitUntil: 'domcontentloaded',
+        timeout: 60000
+      }).catch(e => console.log('Handling SSO redirect...', e.message));
+      await page.waitForSelector('#Email', { timeout: 30000 });
+    }
+
+    console.log('Entering credentials...');
     await page.type('#Email', process.env.CP_EMAIL, { delay: 40 });
     await page.type('#Password', process.env.CP_PASS, { delay: 40 });
 
     console.log('Submitting credentials...');
     await Promise.all([
-      page.waitForNavigation({ waitUntil: 'networkidle2', timeout: 60000 }),
+      page.waitForNavigation({ waitUntil: 'domcontentloaded', timeout: 60000 }).catch(() => {}),
       page.click('#primaryLoginButton')
     ]);
+
+    // Give the post-login SSO redirect a few seconds to settle
+    await new Promise(r => setTimeout(r, 6000));
 
     // Optional: Click "Launch to courses" if needed to establish session cookies for phoenix-ccm
     try {
       const launchBtn = await page.waitForSelector('::-p-text(Launch to courses)', { timeout: 8000 });
       if (launchBtn) {
+        console.log('Clicking Launch to courses...');
         await Promise.all([
-          page.waitForNavigation({ waitUntil: 'networkidle2', timeout: 45000 }),
+          page.waitForNavigation({ waitUntil: 'domcontentloaded', timeout: 45000 }).catch(() => {}),
           launchBtn.click()
         ]);
+        await new Promise(r => setTimeout(r, 5000));
       }
     } catch {
       console.log('Skipping Launch button or already authenticated.');
     }
 
-    // 2. Loop through each Course Assignment URL
-    const courseUrls = process.env.COURSE_URLS.split(',').map(u => u.trim());
+    // 3. Loop through each Course Assignment URL
     const state = loadState();
     const now = new Date();
 
     for (const url of courseUrls) {
       console.log(`Checking course URL: ${url}`);
-      await page.goto(url, { waitUntil: 'networkidle2', timeout: 60000 });
+      await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 60000 }).catch(() => {});
 
       // Wait for Angular to render the assignment cards
       try {
         await page.waitForSelector('section.list-item', { timeout: 25000 });
       } catch {
-        console.log('No assignments currently listed on this page.');
+        console.log('No assignments currently listed on this page (or still loading).');
         continue;
       }
 
@@ -146,7 +170,7 @@ async function runCheck() {
 
       console.log(`Found ${assignments.length} assignments. Checking notification rules...`);
 
-      // 3. Evaluate Notification Rules (New, 7-Day, 1-Day)
+      // 4. Evaluate Notification Rules (New, 7-Day, 1-Day)
       for (const item of assignments) {
         if (!item.title || !item.dateText) continue;
 
@@ -178,8 +202,6 @@ async function runCheck() {
             '0'
           );
           record.notifiedNew = true;
-          // If a new assignment is posted already inside the 7-day or 1-day window,
-          // mark those flags appropriately so you don't get double-pinged right away.
           if (hoursUntilDue <= 168 && hoursUntilDue > 24) record.notified7Days = true;
           if (hoursUntilDue <= 24) {
             record.notified7Days = true;
@@ -207,7 +229,7 @@ async function runCheck() {
             'Due Tomorrow: CoursePoint',
             `${item.title}\nDue in ${hrsLeft} hours (${item.dateText} at ${item.timeText})`,
             url,
-            '1' // Priority 1 = High priority alert
+            '1'
           );
           record.notified1Day = true;
         }
