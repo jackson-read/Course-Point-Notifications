@@ -170,11 +170,17 @@ async function runCheck() {
           const dateText = section.querySelector('.dueDate p')?.innerText.replace(/\s+/g, ' ').trim() || '';
           const timeText = section.querySelector('.dueTime .due-time')?.innerText.replace(/\s+/g, ' ').trim() || '11:59 PM';
 
+          // Grab the submission status ("Submitted", "-", or empty)
+          const statusText = section.querySelector('.assignment-status-container')?.innerText.replace(/\s+/g, ' ').trim() || '';
+          const isSubmitted = statusText.toLowerCase().includes('submitted') || statusText.toLowerCase().includes('completed');
+
           return {
             id: eventId || `${title}-${dateText}`,
             title,
             dateText,
-            timeText
+            timeText,
+            statusText,
+            isSubmitted
           };
         });
       });
@@ -193,6 +199,7 @@ async function runCheck() {
           state[item.id] = {
             title: item.title,
             dueString: `${item.dateText} at ${item.timeText}`,
+            completed: false,
             notifiedNew: false,
             notified7Days: false,
             notified1Day: false
@@ -200,6 +207,16 @@ async function runCheck() {
         }
 
         const record = state[item.id];
+
+        // --- NEW COMPLETION CHECK ---
+        // If CoursePoint shows "Submitted", mark it completed and skip all alerts!
+        if (item.isSubmitted) {
+          record.completed = true;
+          record.notifiedNew = true;
+          record.notified7Days = true;
+          record.notified1Day = true;
+          continue;
+        }
 
         // Rule A: Brand New Assignment Posted
         if (!record.notifiedNew) {
