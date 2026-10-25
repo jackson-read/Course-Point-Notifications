@@ -19,7 +19,19 @@ function saveState(state) {
   fs.writeFileSync(CACHE_FILE, JSON.stringify(state, null, 2));
 }
 
-// --- PUSHOVER NOTIFICATION (Returns true if delivered, false if failed) ---
+// --- PARSE COURSE_URLS ("Class Name|https://...", or plain URL) ---
+function parseCourses(envStr) {
+  return envStr.split(',').map(entry => {
+    const trimmed = entry.trim();
+    if (trimmed.includes('|')) {
+      const [name, url] = trimmed.split('|');
+      return { name: name.trim(), url: url.trim() };
+    }
+    return { name: '', url: trimmed };
+  });
+}
+
+// --- PUSHOVER NOTIFICATION ---
 async function sendPushover(title, message, url, priority = '0') {
   const payload = new URLSearchParams({
     token: process.env.PUSHOVER_TOKEN?.trim(),
@@ -48,7 +60,7 @@ async function sendPushover(title, message, url, priority = '0') {
   }
 }
 
-// --- DATE PARSER FOR COURSEPOINT FORMAT ("Oct 18", "11:59 PM") ---
+// --- DATE PARSER FOR COURSEPOINT FORMAT ("Oct 26", "09:00 AM") ---
 function parseDueDate(dateStr, timeStr) {
   const now = new Date();
   let year = now.getFullYear();
@@ -90,8 +102,8 @@ async function runCheck() {
       'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/129.0.0.0 Safari/537.36'
     );
 
-    const courseUrls = process.env.COURSE_URLS.split(',').map(u => u.trim());
-    const firstCourseUrl = courseUrls[0];
+    const courses = parseCourses(process.env.COURSE_URLS);
+    const firstCourseUrl = courses[0].url;
 
     console.log('Navigating to login portal...');
     await page.goto('https://medicine.lww.com/MyContent', {
@@ -130,7 +142,6 @@ async function runCheck() {
 
     await new Promise(r => setTimeout(r, 6000));
 
-    // Optional: Click "Launch to courses" if present
     try {
       const launchBtn = await page.waitForSelector('::-p-text(Launch to courses)', { timeout: 8000 });
       if (launchBtn) {
@@ -144,13 +155,13 @@ async function runCheck() {
       console.log('Skipping Launch button or already authenticated.');
     }
 
-    // Loop through each Course Assignment URL
     const state = loadState();
     const now = new Date();
     let sentCount = 0;
 
-    for (const url of courseUrls) {
-      console.log(`Checking course URL: ${url}`);
+    for (const course of courses) {
+      const { url } = course;
+      console.log(`Checking course: ${course.name || url}`);
       await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 60000 }).catch(() => {});
 
       try {
@@ -160,9 +171,28 @@ async function runCheck() {
         continue;
       }
 
-      const assignments = await page.evaluate(() => {
-        const items = document.querySelectorAll('section.list-item');
-        return Array.from(items).map(section => {
+      // 1. Expand all "Show Assignments" batch toggle buttons
+      const expandedCount = await page.evaluate(() => {
+        const toggleButtons = document.querySelectorAll('button.batch-assignment-toggle[aria-expanded="false"]');
+        toggleButtons.forEach(btn => btn.click());
+        return toggleButtons.length;
+      });
+
+      if (expandedCount > 0) {
+        console.log(`Expanded ${expandedCount} batch assignment group(s). Waiting for sub-items to load...`);
+        await new Promise(r => setTimeout(r, 2500));
+      }
+
+      // 2. Scrape page course header (as fallback if no custom name in .env) and assignments
+      const pageData = await page.evaluate(() => {
+        // Fallback: Try to grab course title from page header/breadcrumb if not defined in .env
+        const headerEl = document.querySelector('h1, .course-title, .course-name, [class*="courseTitle"], [class*="header-title"]');
+        const detectedCourseName = headerEl?.innerText.replace(/\s+/g, ' ').trim() || '';
+
+        const allSections = Array.from(document.querySelectorAll('section.list-item'));
+        const topLevelSections = allSections.filter(sec => !sec.closest('section.assignment-activity'));
+
+        const items = topLevelSections.map(section => {
           const titleBtn = section.querySelector('button.assignment-title');
           const title = titleBtn?.getAttribute('title') || titleBtn?.innerText.trim();
           const eventId = titleBtn?.getAttribute('data-eventid');
@@ -170,9 +200,22 @@ async function runCheck() {
           const dateText = section.querySelector('.dueDate p')?.innerText.replace(/\s+/g, ' ').trim() || '';
           const timeText = section.querySelector('.dueTime .due-time')?.innerText.replace(/\s+/g, ' ').trim() || '11:59 PM';
 
-          // Grab the submission status ("Submitted", "-", or empty)
           const statusText = section.querySelector('.assignment-status-container')?.innerText.replace(/\s+/g, ' ').trim() || '';
-          const isSubmitted = statusText.toLowerCase().includes('submitted') || statusText.toLowerCase().includes('completed');
+          let isSubmitted = statusText.toLowerCase().includes('submitted') || statusText.toLowerCase().includes('completed');
+
+          const parentLi = section.closest('li[role="listitem"]');
+          if (!isSubmitted && parentLi) {
+            const subSections = Array.from(parentLi.querySelectorAll('section.assignment-activity section.list-item'));
+            if (subSections.length > 0) {
+              const allSubsSubmitted = subSections.every(sub => {
+                const subStatus = sub.querySelector('.assignment-status-container')?.innerText.replace(/\s+/g, ' ').trim().toLowerCase() || '';
+                return subStatus.includes('submitted') || subStatus.includes('completed');
+              });
+              if (allSubsSubmitted) {
+                isSubmitted = true;
+              }
+            }
+          }
 
           return {
             id: eventId || `${title}-${dateText}`,
@@ -183,9 +226,14 @@ async function runCheck() {
             isSubmitted
           };
         });
+
+        return { detectedCourseName, items };
       });
 
-      console.log(`Found ${assignments.length} assignments. Checking notification rules...`);
+      const className = course.name || pageData.detectedCourseName || 'CoursePoint';
+      const assignments = pageData.items;
+
+      console.log(`Found ${assignments.length} top-level assignments for [${className}]. Checking notification rules...`);
 
       for (const item of assignments) {
         if (!item.title || !item.dateText) continue;
@@ -197,6 +245,7 @@ async function runCheck() {
 
         if (!state[item.id]) {
           state[item.id] = {
+            course: className,
             title: item.title,
             dueString: `${item.dateText} at ${item.timeText}`,
             completed: false,
@@ -207,9 +256,9 @@ async function runCheck() {
         }
 
         const record = state[item.id];
+        record.course = className;
 
-        // --- NEW COMPLETION CHECK ---
-        // If CoursePoint shows "Submitted", mark it completed and skip all alerts!
+        // Skip completed assignments (single or batch)
         if (item.isSubmitted) {
           record.completed = true;
           record.notifiedNew = true;
@@ -221,7 +270,7 @@ async function runCheck() {
         // Rule A: Brand New Assignment Posted
         if (!record.notifiedNew) {
           const ok = await sendPushover(
-            'New CoursePoint Assignment',
+            `New Assignment: ${className}`,
             `${item.title}\nDue: ${item.dateText} at ${item.timeText}`,
             url,
             '0'
@@ -242,7 +291,7 @@ async function runCheck() {
         if (!record.notified7Days && hoursUntilDue <= 168 && hoursUntilDue > 24) {
           const daysLeft = Math.ceil(hoursUntilDue / 24);
           const ok = await sendPushover(
-            'Upcoming Due Date (1 Week)',
+            `Due in 1 Week: ${className}`,
             `${item.title}\nDue in ~${daysLeft} days (${item.dateText} at ${item.timeText})`,
             url,
             '0'
@@ -257,7 +306,7 @@ async function runCheck() {
         if (!record.notified1Day && hoursUntilDue <= 24 && hoursUntilDue > 0) {
           const hrsLeft = Math.round(hoursUntilDue);
           const ok = await sendPushover(
-            'Due Tomorrow: CoursePoint',
+            `Due Tomorrow: ${className}`,
             `${item.title}\nDue in ${hrsLeft} hours (${item.dateText} at ${item.timeText})`,
             url,
             '1'
